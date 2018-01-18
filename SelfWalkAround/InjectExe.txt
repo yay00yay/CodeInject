@@ -1,0 +1,185 @@
+// ExeInjection.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+#include <Windows.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+
+bool IsPEFile(LPVOID ImageBase)
+{
+	PIMAGE_DOS_HEADER pDosHeader = NULL;
+	PIMAGE_NT_HEADERS pNtHeader = NULL;
+
+	if (!ImageBase)
+		return false;
+	pDosHeader = (PIMAGE_DOS_HEADER)ImageBase;
+	if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+		return false;
+	pNtHeader = (PIMAGE_NT_HEADERS32)((DWORD)pDosHeader + pDosHeader->e_lfanew);
+	if (pNtHeader->Signature != IMAGE_NT_SIGNATURE)
+		return false;
+	return true;
+}
+
+PIMAGE_NT_HEADERS GetNtHeader(LPVOID ImageBase)
+{
+	if (!IsPEFile(ImageBase))
+		return NULL;
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)ImageBase;
+	return (PIMAGE_NT_HEADERS32)((DWORD)pDosHeader + pDosHeader->e_lfanew);
+}
+
+PIMAGE_FILE_HEADER WINAPI GetFileHeader(LPVOID ImageBase)
+{
+	PIMAGE_FILE_HEADER pFileHeader;
+	PIMAGE_NT_HEADERS pNtHeader = NULL;
+	pNtHeader = GetNtHeader(ImageBase);
+	if (!pNtHeader)
+		return NULL;
+	pFileHeader = &pNtHeader->FileHeader;
+	return pFileHeader;
+}
+
+bool RvaToOffset(LPVOID IpModule, DWORD Rva)
+{
+	DWORD FileOffset;
+	WORD nSectionNum;
+
+	IMAGE_NT_HEADERS *pNTHead;
+	pNTHead = GetNtHeader(IpModule);
+	nSectionNum = pNTHead->FileHeader.NumberOfSections;
+
+	IMAGE_SECTION_HEADER * pSectionHead;
+	pSectionHead = (IMAGE_SECTION_HEADER*)((DWORD)pNTHead + sizeof(IMAGE_NT_HEADERS));
+
+	for(int i=0; i<nSectionNum; i++)
+	{
+		if((pSectionHead->VirtualAddress<=Rva)&&(pSectionHead->VirtualAddress+ pSectionHead->SizeOfRawData))
+		{
+			FileOffset = Rva - pSectionHead->VirtualAddress + pSectionHead->PointerToRawData;
+			return FileOffset;
+		}
+		pSectionHead++;
+	}
+	return false;
+}
+
+
+VOID HandleSessionTable(LPVOID file, LPVOID base)
+{
+	char FuncName[16] = "MessageBoxA";
+	char DLLName[16] = "user32.dll";
+	char Caption[16] = "Warning";
+	char Content[16] = "This is me!";
+	DWORD LoadLibraryAAddr = 0X1f864;
+	DWORD GetProcAddress = 0X24c46;
+
+	char codes[] = "\x60\xe8\x0\x0\x0\x0\x0\x5f\x83\xef\x6\x8b\x4f\xf8\x8b"
+				   "\x5f\xfc\x64\x8b\x15\x30\x0\x0\x0\x8b\x52\xc\x8b\x52\x1c\x8b"
+				   "\x12\x8b\x42\x8\x8b\x42\x50\x3\xc8\x50\x8b\xd7\x83\xea\x38\x52"
+	               "\xff\xd1\x8b\xc8\x58\x3\xd8\x8b\xd7\x83\xea\x48\x52\x51\xff\xd3"
+	               "\x8b\xcf\x83\xe9\x18\x6a\x0\x51\x83\xe9\x10\x51\x6a\x0\xff\xd0\x61"
+	               "\xe9\x00\x00\x00\x00";
+	int datalength = 16 * 4 + 8;
+	int codelength = sizeof(codes) - 1;
+
+	IMAGE_NT_HEADERS * nthead = GetNtHeader(base);
+	IMAGE_SECTION_HEADER* sectionhead = (IMAGE_SECTION_HEADER*)((DWORD)nthead + sizeof(IMAGE_NT_HEADERS));
+
+	if (sectionhead->VirtualAddress == NULL)
+		return;
+	DWORD sectionnum = nthead->FileHeader.NumberOfSections;
+	IMAGE_SECTION_HEADER* p = sectionhead;
+	DWORD sFileSize = GetFileSize(base,NULL);
+	std::cout << sectionnum << std::endl;
+	for(int i=0; i<sectionnum; i++)
+	{
+		std::cout << (char*)p->Name << " " << (int)p->SizeOfRawData - (int)p->Misc.VirtualSize << std::endl;
+		if((int)p->SizeOfRawData-(int)p->Misc.VirtualSize>codelength+datalength && (p->Characteristics&IMAGE_SCN_MEM_EXECUTE))
+		{
+			DWORD datavirtualbase = p->VirtualAddress + p->Misc.VirtualSize;
+			DWORD datafileoffset = p->PointerToRawData + p->Misc.VirtualSize;
+			SetFilePointer(file, datafileoffset, NULL, FILE_BEGIN);
+			WriteFile(file, FuncName, 16, 0, 0);
+			WriteFile(file, DLLName, 16, 0, 0);
+			WriteFile(file, Caption, 16, 0, 0);
+			WriteFile(file, Content, 16, 0, 0);
+			WriteFile(file, &LoadLibraryAAddr, 4, 0, 0);
+			WriteFile(file, &GetProcAddress, 4, 0, 0);			
+			DWORD codevirtualbase = p->VirtualAddress + p->Misc.VirtualSize + datalength;
+			DWORD codefileoffset = p->PointerToRawData + p->Misc.VirtualSize + datalength;
+			p->Misc.VirtualSize += (codelength + datalength);
+			SetFilePointer(file, codefileoffset, NULL, FILE_BEGIN);
+			DWORD oldentry = nthead->OptionalHeader.AddressOfEntryPoint;
+			DWORD JMPOFFSET = oldentry - (codevirtualbase + codelength -5)+5;
+			memcpy(codes + codelength - 4, &JMPOFFSET, sizeof(DWORD));
+			nthead->OptionalHeader.AddressOfEntryPoint = codevirtualbase;
+			DWORD writesize = 0;
+			SetFilePointer(file, codefileoffset, NULL, FILE_BEGIN);
+			if (!WriteFile(file, codes, codelength, &writesize, 0))
+			{
+				TCHAR * buffer;
+				::FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, nullptr, GetLastError(), 0, (LPTSTR)&buffer, 0, nullptr);
+				MessageBox(0, buffer, L"OK", 0);
+			}
+			std::cout << codelength << " " << std::endl;
+			std::cout << writesize << std::endl;
+			std::cout << "Success" << std::endl;
+			break;
+		}
+		p++;
+	}
+}
+
+DWORD RvaToVirtualAddress(LPVOID IpModule, DWORD Rva)
+{
+	DWORD offset = RvaToOffset(IpModule, Rva);
+	return (DWORD)IpModule + offset;
+}
+
+
+PIMAGE_OPTIONAL_HEADER GetOptionalHeader(LPVOID ImageBase)
+{
+	PIMAGE_OPTIONAL_HEADER pOptionalHeader = NULL;
+	PIMAGE_NT_HEADERS pNtHeader = NULL;
+	pNtHeader = GetNtHeader(ImageBase);
+	if (!pNtHeader)
+		return NULL;
+	pOptionalHeader = &pNtHeader->OptionalHeader;
+	return pOptionalHeader;
+}
+
+int main()
+{
+	HANDLE hFile = CreateFile(L"Hello.exe", GENERIC_READ | GENERIC_WRITE, NULL, nullptr, OPEN_EXISTING,
+	                          FILE_ATTRIBUTE_NORMAL, nullptr);
+	HANDLE hFileMap = CreateFileMapping(hFile, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+	if(!hFileMap)
+	{
+		TCHAR *buffer;
+		::FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, nullptr, GetLastError(), 0, (LPTSTR)&buffer, 0, nullptr);
+		MessageBox(0, buffer, L"OK", 0);
+	}
+
+	LPVOID IpMemory = MapViewOfFile(hFileMap, FILE_MAP_READ | FILE_MAP_WRITE, NULL, NULL, NULL);
+
+	if(IsPEFile(IpMemory))
+	{
+		std::cout << "PE file." << std::endl;
+		IMAGE_NT_HEADERS * nthead = GetNtHeader(IpMemory);
+		IMAGE_OPTIONAL_HEADER32 * image = GetOptionalHeader(IpMemory);
+		std::cout << "DataDirectory num: " << image->NumberOfRvaAndSizes << std::endl;
+		HandleSessionTable(hFile, IpMemory);
+	}else
+	{
+		std::cout << "no" << std::endl;
+	}
+
+	UnmapViewOfFile(IpMemory);
+	CloseHandle(hFileMap);
+	CloseHandle(hFile);
+	system("pause");
+}
+
